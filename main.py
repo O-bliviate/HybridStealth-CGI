@@ -1,7 +1,6 @@
 from loguru import logger
 import arguments
 import os
-from utils.methods import mdlg, mdlg_mt
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
@@ -13,8 +12,9 @@ from utils.net_utils import intialize_nets
 from utils.save import save_results
 from utils.figure import plot_metrics
 
-# [关键修改]: 引入我们重构后的模块
-from utils.models import MaliciousResNet18, get_loki_kernel  # 假设恶意模型定义在 models.py
+# [关键修改]: 适配 Soft LOKI (统计指纹)
+# 移除了 get_loki_kernel，引入 inject_client_fingerprint
+from utils.models import MaliciousModel, inject_client_fingerprint
 from utils.hybrid_attack import HybridStealthAttacker
 
 
@@ -30,6 +30,9 @@ def main():
     data_path = os.path.join(root_path, 'data').replace('\\', '/')
     save_path = os.path.join(root_path, args.get_debugOrRun() + '/compare_%s' % dataset_name).replace('\\', '/')
 
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+
     lr = args.get_lr()
     num_dummy = args.get_num_dummy()
     Iteration = args.get_iteration()
@@ -44,6 +47,9 @@ def main():
     args.logger.info(f'device is {device}')
 
     # 加载数据
+    # 强制设置 N=100 以匹配实验设计
+    args.num_clients = 100
+
     tt, tp, num_classes, alter_num_classes, channel, hidden, dst, input_size, idx_shuffle, mean_std = load_data(
         dataset=dataset_name, root_path=root_path, data_path=data_path, save_path=save_path)
 
@@ -57,99 +63,105 @@ def main():
             args.logger.info('#{}, Try to generate #{} images', method, num_dummy)
 
             # =================================================================
-            # [修改部分]: HybridStealth 攻击逻辑重构
+            # [修改部分]: HybridStealth 100客户端批量仿真 (Soft LOKI版)
             # =================================================================
             if method == 'HybridStealth':
-                args.logger.info("Initializing HybridStealth-CGI Attack...")
+                args.logger.info("Initializing HybridStealth-CGI Batch Simulation...")
 
-                # 1. 初始化恶意全局模型 (包含 PMM 层)
-                # 注意: 我们不使用 intialize_nets，而是使用专门的恶意模型类
-                global_model = MaliciousResNet18(num_classes=num_classes, pmm_enabled=True, device=device).to(device)
+                # 1. 初始化恶意全局模型 (标准 ResNet + PMM)
+                global_model = MaliciousModel(num_clients=args.num_clients,
+                                              num_classes=num_classes,
+                                              pmm_enabled=True,
+                                              device=device).to(device)
 
-                # 2. LOKI: 生成并注入恶意卷积核
-                # 假设攻击目标是 idx_shuffle[0] 对应的那个逻辑客户端ID
-                # 为了简化，我们假设逻辑ID就是 0
-                target_client_logic_id = 0
-                # 获取第一层卷积的参数维度
-                out_channels = global_model.base.conv1.out_channels
-                in_channels = global_model.base.conv1.in_channels
+                # 容器: 用于存储所有客户端梯度的总和 (模拟安全聚合)
+                aggregated_gradients_sum = {}
 
-                loki_kernel = get_loki_kernel(target_client_logic_id, args.num_clients, in_channels, out_channels)
+                # 容器: 存储所有客户端的真实数据 (Ground Truth) 用于后续评估
+                gt_data_list = []
 
-                # 注入卷积核
-                with torch.no_grad():
-                    global_model.base.conv1.weight.data = loki_kernel.to(device)
-                args.logger.info("LOKI Kernels injected for Target Client #0")
+                # 起始索引
+                start_img_idx = args.get_imidx()
 
-                # 3. 模拟客户端训练与梯度捕获 (Client Side Simulation)
-                # 获取真实目标图像和标签
-                # idx_shuffle[0] 是数据集中的索引
-                gt_img = tt(dst[idx_shuffle[0]][0]).float().to(device).unsqueeze(0)  # [1, C, H, W]
-                gt_label = torch.tensor([dst[idx_shuffle[0]][1]]).long().to(device)
+                args.logger.info(f">>> Simulating Secure Aggregation for {args.num_clients} Clients...")
 
-                # 前向传播计算 Loss (包含 PMM 恶意损失)
-                optimizer = optim.SGD(global_model.parameters(), lr=args.lr)
-                optimizer.zero_grad()
+                # 2. 循环模拟 100 个客户端
+                for i in range(args.num_clients):
+                    # A. 准备数据
+                    current_data_idx = idx_shuffle[i]
+                    gt_img = tt(dst[current_data_idx][0]).float().to(device).unsqueeze(0)
+                    gt_label = torch.tensor([dst[current_data_idx][1]]).long().to(device)
+                    gt_data_list.append(gt_img)
 
-                output, pmm_loss = global_model(gt_img)
-                cls_loss = F.cross_entropy(output, gt_label)
+                    # B. [关键修改] Soft LOKI: 注入统计指纹
+                    # 不再修改卷积核，而是修改 PMM 层的权重分布
+                    # 这会让 Client i 的数据在 PMM 输出的特定频段产生强激活
+                    inject_client_fingerprint(global_model, i, args.num_clients)
 
-                # 组合损失: 分类损失 + PMM损失 (pmm_scale 通常较大，如10.0)
-                total_loss = cls_loss + args.pmm_scale * pmm_loss
-                total_loss.backward()
+                    # C. 本地训练与梯度计算
+                    optimizer = optim.SGD(global_model.parameters(), lr=args.lr)
+                    optimizer.zero_grad()
 
-                # 捕获梯度 (模拟从安全聚合中分离出的梯度)
-                # 构造符合 HybridStealthAttacker 接口的字典结构
-                # 假设有两个合谋服务器，它们看到的梯度是近似的 (在Input Space匹配时)
-                # 关键是捕获 PMM 层的梯度用于 Phase 1 解析
+                    output, pmm_loss, _ = global_model(gt_img)
+                    cls_loss = F.cross_entropy(output, gt_label)
+
+                    # 组合损失
+                    total_loss = cls_loss + args.pmm_scale * pmm_loss
+                    total_loss.backward()
+
+                    # D. 安全聚合 (累加)
+                    for name, param in global_model.named_parameters():
+                        if param.grad is not None:
+                            if name not in aggregated_gradients_sum:
+                                aggregated_gradients_sum[name] = torch.zeros_like(param.grad)
+                            aggregated_gradients_sum[name] += param.grad.detach()
+
+                    if (i + 1) % 10 == 0:
+                        args.logger.info(f"   Processed Client {i + 1}/{args.num_clients}")
+
+                args.logger.info("Secure Aggregation Completed. Gradients Captured.")
+
+                # 构造梯度字典
                 captured_gradients = {
-                    'server_1': {k: v.grad.clone() for k, v in global_model.named_parameters() if v.grad is not None},
-                    # 实际场景中 Server 2 的梯度可能略有不同(因任务不同)，这里简化为相同
-                    'server_2': {k: v.grad.clone() for k, v in global_model.named_parameters() if v.grad is not None}
+                    'server_1': aggregated_gradients_sum,
+                    'server_2': aggregated_gradients_sum
                 }
-                args.logger.info(f"Gradients captured. PMM Loss: {pmm_loss.item():.4f}")
 
-                # 4. 执行攻击 (Phase 1 解析 + Phase 2 优化)
+                # 3. 执行批量攻击
                 attacker = HybridStealthAttacker(args, global_model, device)
 
-                # 调用重构
-                # [修正]: 关键字必须是 aggregated_gradients (与类定义一致)
-                # 实参仍然是 captured_gradients (这是你在 main 中定义的变量名)
-                reconstructed_img = attacker.reconstruct(
+                # 调用批量重构接口
+                rec_imgs, leak_rate, avg_psnr = attacker.reconstruct_all(
                     aggregated_gradients=captured_gradients,
-                    target_dims=(channel, input_size, input_size)  # (C, H, W)
+                    gt_data_list=gt_data_list
                 )
 
-                # 5. 结果处理与保存
-                # 为了兼容 save_results 的接口，我们需要构造一个 results 列表
-                # 计算最终指标
-                mse = F.mse_loss(reconstructed_img, gt_img).item()
-                # 这里简单计算 PSNR
-                psnr = 10 * torch.log10(1 / torch.tensor(mse)).item() if mse > 0 else 100
+                # 将 leakage_rate 改为 leak_rate
+                args.logger.info(f"Batch Attack Finished. Leakage Rate: {leak_rate:.2f}%, Avg PSNR: {avg_psnr:.2f}")
 
-                args.logger.info(f"Attack Finished. Final MSE: {mse:.6f}, PSNR: {psnr:.2f}")
-
-                # 构造 result 列表: [iter, mse, lpips, psnr, ssim]
-                # 注意: 这里只有最终结果，没有中间迭代的历史记录，除非 attacker.reconstruct 返回历史
-                # 简单起见，我们只存一行
-                final_results = [[Iteration, mse, 0.0, psnr, 0.0]]
+                # 4. 保存结果
+                final_results = [[Iteration, 0.0, 0.0, avg_psnr, 0.0]]  # 仅记录 Avg PSNR
 
                 # 保存 CSV
                 save_results(final_results,
-                             root_path + '/HybridStealth_' + str(idx_shuffle[0]) + '_' + args.get_dataset() + '.csv',
+                             root_path + '/HybridStealth_Batch_N' + str(args.num_clients) + '.csv',
                              args)
 
-                # 保存对比图片
-                # 将真实图片和重构图片拼接
-                comparison = torch.cat([gt_img.detach().cpu(), reconstructed_img.detach().cpu()])
-                save_image_path = save_path + f"/hybrid_stealth_{idx_shuffle[0]}.png"
-                # 确保目录存在
-                if not os.path.exists(save_path): os.makedirs(save_path)
-                torchvision.utils.save_image(comparison, save_image_path)
-                args.logger.info(f"Result image saved to {save_image_path}")
+                # 保存可视化
+                if len(rec_imgs) > 0:
+                    vis_list = []
+                    count = min(8, len(rec_imgs))
+                    for k in range(count):
+                        vis_list.append(gt_data_list[k].detach().cpu())
+                        vis_list.append(rec_imgs[k])
+
+                    grid = torchvision.utils.make_grid(torch.cat(vis_list), nrow=2, padding=2, normalize=True)
+                    save_image_path = save_path + f"/batch_attack_N{args.num_clients}.png"
+                    torchvision.utils.save_image(grid, save_image_path)
+                    args.logger.info(f"Result image saved to {save_image_path}")
 
             # =================================================================
-            # 原有方法保留 (mDLG, mDLG_mt 等)
+            # 原有方法保留
             # =================================================================
             if method == 'mDLG':
                 nets = intialize_nets(method=method, args=args, channel=channel, hidden=hidden, num_classes=num_classes,
@@ -179,7 +191,6 @@ def main():
                     args.num_servers) + '_' + str_time + '_' + args.defense_method + '.csv', args)
                 plot_metrics(results, args, save_path)
 
-        # args.logger.info('imidx_list: #{}', imidx_list)
     logger.remove(handler)
 
 

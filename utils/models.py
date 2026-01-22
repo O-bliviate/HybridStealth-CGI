@@ -5,134 +5,108 @@ import torchvision
 
 class ParsableLinear(nn.Module):
     """
-    可解析恶意模块 (PMM) - 线性层版本
-
-    功能:
-    1. 作为一个全连接层，负责将特征映射到 logits。
-    2. 包含一个预设的目标矩阵 T (攻击者已知)。
-    3. 提供 compute_malicious_loss 方法，强制输出 Z 逼近 T。
-
-    理论基础: HybridStealth-CGI Section 3.3.1 [cite: 35, 44]
+    [基于统计特性的 PMM]
+    不依赖物理隔离，而是通过权重初始化创造 '统计指纹'。
     """
 
-    def __init__(self, input_dim, output_dim, target_scale=10.0, device='cpu'):
+    def __init__(self, input_dim, output_dim, device='cpu'):
         super(ParsableLinear, self).__init__()
-        # 标准线性层
-        self.linear = nn.Linear(input_dim, output_dim)
-
-        # 预设的目标矩阵 T，攻击者已知
-        # 放大 scale 可以增加 PMM 损失在总损失中的比重，强化梯度控制
-        self.target_matrix = torch.randn(output_dim).to(device) * target_scale
+        self.input_dim = input_dim
+        self.output_dim = output_dim
         self.device = device
 
+        # 线性层
+        self.linear = nn.Linear(input_dim, output_dim, bias=False)
+
+        # 目标矩阵 T (攻击者已知)
+        self.target_matrix = torch.randn(output_dim).to(device) * 10.0
+
+    def inject_statistical_fingerprint(self, client_idx, total_clients):
+        """
+        [关键] 为特定客户端注入统计指纹 (Soft LOKI)
+
+        原理: 将 W_pmm 设计为近似块对角。
+        在属于该 Client 的输出列区间内，权重由 target_client 的数据主导。
+        """
+        # 计算该客户端的"专属频段" (Block)
+        block_size = self.output_dim // total_clients
+        if block_size < 1: block_size = 1
+
+        start_col = client_idx * block_size
+        end_col = start_col + block_size
+
+        with torch.no_grad():
+            # 1. 全局背景: 低能量噪声 (模拟其他客户端的干扰)
+            self.linear.weight.data.normal_(0, 0.001)
+
+            # 2. 专属频段: 高能量指纹 (Strong Activation)
+            # 在这个块内，我们使用高增益的正交初始化，确保梯度能量集中
+            # 注意: PyTorch Linear weight shape is [Out, In]
+            # 我们要操作的是 output channel (rows in weight matrix)
+
+            fingerprint = torch.empty(end_col - start_col, self.input_dim)
+            nn.init.orthogonal_(fingerprint, gain=2.0)  # Gain > 1 创造强信号
+
+            self.linear.weight.data[start_col:end_col, :] = fingerprint.to(self.device)
+
     def forward(self, x):
-        out = self.linear(x)
-        return out
+        return self.linear(x)
 
     def compute_malicious_loss(self, out):
-        """
-        计算恶意损失 L_pmm = 1/2 * || Z - T ||_F^2
-        """
-        # 广播目标矩阵以匹配 Batch Size (B, D_out)
         if out.shape[0] != self.target_matrix.shape[0]:
             target_batch = self.target_matrix.expand_as(out)
         else:
             target_batch = self.target_matrix
-
-        # 计算 Frobenius 范数
-        loss = 0.5 * torch.norm(out - target_batch, p='fro') ** 2
-        return loss
+        return 0.5 * torch.norm(out - target_batch, p='fro') ** 2
 
 
-class MaliciousResNet18(nn.Module):
+class MaliciousModel(nn.Module):
     """
-    集成 PMM 的 ResNet-18 模型
-
-    特点:
-    1. 针对 CIFAR-100 (32x32) 修改了第一层卷积和池化层，保留空间特征。
-    2. 移除了原始的全连接层，替换为 ParsableLinear (PMM)。
-    3. Forward 返回 (output, malicious_loss) 元组。
-
-    理论基础: WWW.md Section 4.2
+    [回归标准架构]
+    不再需要极宽的卷积层，这提高了攻击的隐蔽性。
+    依赖 PMM 层的统计特性进行分离。
     """
 
-    def __init__(self, num_classes=100, pmm_enabled=True, device='cpu'):
-        super(MaliciousResNet18, self).__init__()
-        # 加载标准 ResNet18 骨架 (不预训练)
+    def __init__(self, num_clients=100, num_classes=100, pmm_enabled=True, device='cpu'):
+        super(MaliciousModel, self).__init__()
+
+        # 使用标准 ResNet18 (或稍作修改适配 CIFAR)
+        # 不再动态扩大 Conv1 通道
         self.base = torchvision.models.resnet18(pretrained=False)
-
-        # [关键修改]: 适配 CIFAR-100 的小尺寸输入 (32x32)
-        # 原始 ResNet 用于 ImageNet (224x224)，第一层是 7x7 conv, stride 2
-        # 这里改为 3x3 conv, stride 1, padding 1，避免信息过早丢失
         self.base.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-
-        # 移除 MaxPool，避免对 32x32 图像降采样过快
         self.base.maxpool = nn.Identity()
-
-        # 移除原始 FC 层
         self.base.fc = nn.Identity()
 
         self.pmm_enabled = pmm_enabled
+        self.device = device
 
-        # PMM 层作为分类头
-        # ResNet18 的 feature dim 是 512
+        # PMM 层 (ResNet18 feat dim = 512)
+        # 为了支持 Soft LOKI 分离，Output Dim 最好 >= Num_Clients * k (k>=1)
+        # 如果 num_classes=100, clients=100, 则每人分配 1 个神经元用于分离
         self.pmm = ParsableLinear(512, num_classes, device=device)
 
     def forward(self, x):
-        # 提取特征
         feat = self.base.conv1(x)
         feat = self.base.bn1(feat)
         feat = self.base.relu(feat)
-        feat = self.base.maxpool(feat)  # Identity
-
         feat = self.base.layer1(feat)
         feat = self.base.layer2(feat)
         feat = self.base.layer3(feat)
         feat = self.base.layer4(feat)
-
         feat = self.base.avgpool(feat)
-        feat = torch.flatten(feat, 1)  # Flatten: [B, 512]
+        feat = torch.flatten(feat, 1)
 
-        # 通过 PMM 层
-        out = self.pmm(feat)
+        logits = self.pmm(feat)
 
-        malicious_loss = torch.tensor(0.0).to(x.device)
+        malicious_loss = torch.tensor(0.0).to(self.device)
         if self.pmm_enabled:
-            malicious_loss = self.pmm.compute_malicious_loss(out)
+            malicious_loss = self.pmm.compute_malicious_loss(logits)
 
-        return out, malicious_loss
+        # [修正]: 必须返回 malicious_loss，而不是 0.0
+        # 同时返回 feat 供 Phase 2 使用
+        return logits, malicious_loss, feat
 
 
-def get_loki_kernel(client_idx, total_clients, in_channels, out_channels):
-    """
-    LOKI: 生成定制化的卷积核 (Identity Mapping Sets)
-
-    功能:
-    为每个客户端分配特定的输出通道切片，使其梯度互不重叠。
-
-    理论基础: LOKI Section 3.4 / WWW.md Section 4.2 [cite: 53, 156]
-    """
-    # 初始化全零卷积核 [Out, In, K, K]
-    kernel = torch.zeros(out_channels, in_channels, 3, 3)
-
-    # 计算该客户端的通道分配 (Split Scaling)
-    # 逻辑: 将总输出通道数平均分配给 N 个客户端
-    channels_per_client = out_channels // total_clients
-
-    # 防止通道数不够分的情况
-    if channels_per_client < 1:
-        channels_per_client = 1
-
-    start_ch = (client_idx * channels_per_client) % out_channels
-    end_ch = start_ch + channels_per_client
-
-    # 设置中心点为 1.0 (Identity Pass-through)
-    # 这确保了输入特征图被"搬运"到特定的输出通道
-    for c in range(start_ch, end_ch):
-        # 简单的取模映射，确保 input_c 在有效范围内
-        input_c = c % in_channels
-
-        # 在卷积核中心位置置 1
-        kernel[c, input_c, 1, 1] = 1.0
-
-    return kernel
+# 辅助函数: 模拟服务器下发指纹模型
+def inject_client_fingerprint(model, client_idx, total_clients):
+    model.pmm.inject_statistical_fingerprint(client_idx, total_clients)
